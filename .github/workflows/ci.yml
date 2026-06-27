@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  nix:
+    permissions:
+      contents: read
+      packages: write
+    uses: SeineEloquenz/ci/.github/workflows/nix-ci.yml@main
+    with:
+      images: '["image"]'
+    secrets: inherit
