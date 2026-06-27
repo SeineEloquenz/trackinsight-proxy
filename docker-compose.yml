@@ -1,0 +1,21 @@
+name: trackinsight-proxy
+
+services:
+  chrome:
+    image: docker.io/chromedp/headless-shell:latest
+    init: true
+    # headless-shell's entrypoint already passes
+    #   --no-sandbox --remote-debugging-address=0.0.0.0 --remote-debugging-port=9222
+    restart: unless-stopped
+
+  trackinsight-proxy:
+    image: ghcr.io/seineeloquenz/trackinsight-proxy:latest
+    depends_on:
+      - chrome
+    environment:
+      CHROME_URL: http://chrome:9222
+      SOLVER_PORT: "8191"
+      RUST_LOG: info
+    ports:
+      - "8191:8191"
+    restart: unless-stopped
