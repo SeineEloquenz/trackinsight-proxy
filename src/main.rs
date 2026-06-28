@@ -67,19 +67,17 @@ struct FetchResult {
     body: String,
 }
 
-/// Holds the live CDP connection. `_browser` must be kept alive; all access is
-/// serialised by the outer `Mutex`.
+/// Live CDP connection to Chrome; all access is serialised by the outer `Mutex`.
 struct Solver {
     cfg: Config,
-    _browser: Browser,
+    browser: Browser,
     page: ChaserPage,
 }
 
 impl Solver {
     async fn connect(cfg: &Config) -> Result<Self> {
-        // Resolve the Chrome host to an IP first: Chrome's DevTools endpoint
-        // rejects (DNS-rebinding protection) any `Host` header that is not an IP
-        // literal or `localhost`, so connecting by service name would be reset.
+        // Chrome's DevTools rejects a `Host` that isn't an IP or `localhost`
+        // (DNS-rebinding guard), so connect by resolved IP, not the hostname.
         let addr: SocketAddr =
             tokio::net::lookup_host((cfg.chrome_host.as_str(), cfg.chrome_port))
                 .await
@@ -92,7 +90,6 @@ impl Solver {
         tokio::spawn(async move { while handler.next().await.is_some() {} });
 
         let page = browser.new_page("about:blank").await?;
-        // Best-effort script-injection stealth (UA, navigator.webdriver, …).
         if let Err(e) = page.enable_stealth_mode().await {
             tracing::warn!("enable_stealth_mode failed (continuing): {e}");
         }
@@ -100,19 +97,18 @@ impl Solver {
 
         let solver = Self {
             cfg: cfg.clone(),
-            _browser: browser,
+            browser,
             page: chaser,
         };
         solver.warm().await?;
         Ok(solver)
     }
 
-    /// Navigate to the site so the AWS WAF SDK runs and mints the `aws-waf-token`,
-    /// then confirm an API fetch actually succeeds.
+    /// Navigate the page so the AWS WAF SDK mints the `aws-waf-token`, then
+    /// confirm an API fetch succeeds.
     async fn warm(&self) -> Result<()> {
         let url_lit = serde_json::to_string(&self.cfg.warm_url)?;
-        // The execution context is torn down by the navigation, so an error here
-        // (e.g. "context destroyed") is expected and ignored.
+        // Navigation tears down the execution context, so ignore the error.
         let _ = self
             .page
             .evaluate(format!("window.location.href = {url_lit}").as_str())
@@ -127,7 +123,6 @@ impl Solver {
         }
     }
 
-    /// Perform a single in-page `fetch` of `path` against the configured origin.
     async fn fetch_once(&self, path: &str) -> Result<FetchResult> {
         let url = format!("{}{}", self.cfg.origin, path);
         let url_lit = serde_json::to_string(&url)?;
@@ -146,16 +141,34 @@ impl Solver {
         Ok(serde_json::from_value(value)?)
     }
 
-    /// Proxy a request, re-warming + retrying once if the WAF challenges us
-    /// (HTTP 202 / empty body) — e.g. after the ~5 minute token TTL.
+    /// Open a fresh tab on the same connection and re-warm it. Errors if the
+    /// connection is gone, so the caller can fall back to a full reconnect.
+    async fn relaunch(&mut self) -> Result<()> {
+        // Close the old tab so they don't accumulate.
+        let _ = self.page.raw_page().clone().close().await;
+
+        let page = self.browser.new_page("about:blank").await?;
+        if let Err(e) = page.enable_stealth_mode().await {
+            tracing::warn!("enable_stealth_mode failed (continuing): {e}");
+        }
+        self.page = ChaserPage::new(page);
+        self.warm().await
+    }
+
+    /// Proxy a request; re-warm and retry once if the result looks degraded.
     async fn proxy(&self, path: &str) -> Result<FetchResult> {
         let res = self.fetch_once(path).await?;
-        if res.status == 202 || res.body.is_empty() {
-            tracing::info!(path, "challenge/empty -> re-warming and retrying");
+        if Self::is_degraded(&res) {
+            tracing::info!(path, status = res.status, "degraded -> re-warming and retrying");
             self.warm().await.ok();
             return self.fetch_once(path).await;
         }
         Ok(res)
+    }
+
+    /// Degraded = WAF challenge (202), empty body, or in-page fetch threw (0).
+    fn is_degraded(res: &FetchResult) -> bool {
+        res.status == 0 || res.status == 202 || res.body.is_empty()
     }
 }
 
@@ -176,6 +189,28 @@ async fn connect_with_retry(cfg: &Config) -> Result<Solver> {
     Solver::connect(cfg).await.context("final connect attempt")
 }
 
+/// Recover a degraded session: relaunch a fresh tab when the connection is alive
+/// (`try_relaunch`), otherwise (or on relaunch failure) reconnect.
+async fn recover(shared: &Shared, cfg: &Config, try_relaunch: bool) {
+    if try_relaunch {
+        // `new_page`/`close` can hang on a half-dead connection; bound it.
+        let relaunched = {
+            let mut guard = shared.lock().await;
+            tokio::time::timeout(Duration::from_secs(45), guard.relaunch()).await
+        };
+
+        match relaunched {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => tracing::warn!("relaunch failed ({e}); reconnecting to Chrome"),
+            Err(_) => tracing::warn!("relaunch timed out; reconnecting to Chrome"),
+        }
+    }
+
+    if let Ok(solver) = connect_with_retry(cfg).await {
+        *shared.lock().await = solver;
+    }
+}
+
 async fn health() -> StatusCode {
     StatusCode::OK
 }
@@ -192,22 +227,22 @@ async fn proxy_handler(State(shared): State<Shared>, uri: Uri) -> Response {
             .into_response();
     }
 
-    // First attempt.
     let first = shared.lock().await.proxy(&path).await;
-    let res = match first {
-        Ok(res) => Ok(res),
-        Err(e) => {
-            // The CDP connection likely dropped (sidecar restart). Reconnect once.
-            tracing::warn!(path, error = %e, "proxy failed; reconnecting");
-            let cfg = shared.lock().await.cfg.clone();
-            match connect_with_retry(&cfg).await {
-                Ok(solver) => {
-                    *shared.lock().await = solver;
-                    shared.lock().await.proxy(&path).await
-                }
-                Err(e) => Err(e),
-            }
-        }
+
+    // `Err` = connection dropped (reconnect); `Ok` degraded = page bad but
+    // connection alive (relaunch first).
+    let (degraded, try_relaunch) = match &first {
+        Err(_) => (true, false),
+        Ok(res) => (Solver::is_degraded(res), true),
+    };
+
+    let res = if degraded {
+        tracing::warn!(path, "session degraded; recovering");
+        let cfg = shared.lock().await.cfg.clone();
+        recover(&shared, &cfg, try_relaunch).await;
+        shared.lock().await.proxy(&path).await
+    } else {
+        first
     };
 
     match res {
@@ -281,10 +316,8 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(180)).await;
                 let warmed = shared.lock().await.warm().await;
                 if let Err(e) = warmed {
-                    tracing::warn!("re-warm failed ({e}); reconnecting");
-                    if let Ok(solver) = connect_with_retry(&cfg).await {
-                        *shared.lock().await = solver;
-                    }
+                    tracing::warn!("re-warm failed ({e}); recovering");
+                    recover(&shared, &cfg, true).await;
                 }
             }
         });
