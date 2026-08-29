@@ -100,8 +100,52 @@ impl Solver {
             browser,
             page: chaser,
         };
-        solver.warm().await?;
+        solver.sweep().await;
+        if let Err(e) = solver.warm().await {
+            solver.close().await;
+            return Err(e);
+        }
         Ok(solver)
+    }
+
+    /// `Page` has no `Drop` impl, and the `Browser` we attach to owns no child
+    /// process, so a tab not closed here stays open for the browser's lifetime.
+    async fn close(&self) {
+        let page = self.page.raw_page().clone();
+        if tokio::time::timeout(Duration::from_secs(10), page.close())
+            .await
+            .is_err()
+        {
+            tracing::warn!("closing tab timed out");
+        }
+    }
+
+    /// Close tabs stranded by earlier connections. Assumes this proxy is the only
+    /// client of the browser.
+    async fn sweep(&self) {
+        let keep = self.page.raw_page().target_id().clone();
+        let pages = match self.browser.pages().await {
+            Ok(pages) => pages,
+            Err(e) => {
+                tracing::warn!("sweep: listing pages failed: {e}");
+                return;
+            }
+        };
+
+        let mut closed = 0usize;
+        for page in pages {
+            if *page.target_id() == keep {
+                continue;
+            }
+            match tokio::time::timeout(Duration::from_secs(10), page.close()).await {
+                Ok(Ok(())) => closed += 1,
+                Ok(Err(e)) => tracing::warn!("sweep: close failed: {e}"),
+                Err(_) => tracing::warn!("sweep: close timed out"),
+            }
+        }
+        if closed > 0 {
+            tracing::info!(closed, "sweep: closed stranded tabs");
+        }
     }
 
     /// Navigate the page so the AWS WAF SDK mints the `aws-waf-token`, then
@@ -207,7 +251,11 @@ async fn recover(shared: &Shared, cfg: &Config, try_relaunch: bool) {
     }
 
     if let Ok(solver) = connect_with_retry(cfg).await {
-        *shared.lock().await = solver;
+        let old = {
+            let mut guard = shared.lock().await;
+            std::mem::replace(&mut *guard, solver)
+        };
+        old.close().await;
     }
 }
 
