@@ -2,6 +2,10 @@
 
 use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 
+const WARM_INTERVAL: Duration = Duration::from_secs(180);
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
 use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Body,
@@ -30,8 +34,7 @@ impl Config {
     fn from_env() -> Self {
         let origin = env::var("TRACKINSIGHT_ORIGIN")
             .unwrap_or_else(|_| "https://www.trackinsight.com".to_string());
-        let warm_url =
-            env::var("WARM_URL").unwrap_or_else(|_| format!("{origin}/en/etf/US/QQQ/"));
+        let warm_url = env::var("WARM_URL").unwrap_or_else(|_| format!("{origin}/en/etf/US/QQQ/"));
         let warm_delay = Duration::from_secs(
             env::var("WARM_DELAY_SECS")
                 .ok()
@@ -78,12 +81,11 @@ impl Solver {
     async fn connect(cfg: &Config) -> Result<Self> {
         // Chrome's DevTools rejects a `Host` that isn't an IP or `localhost`
         // (DNS-rebinding guard), so connect by resolved IP, not the hostname.
-        let addr: SocketAddr =
-            tokio::net::lookup_host((cfg.chrome_host.as_str(), cfg.chrome_port))
-                .await
-                .with_context(|| format!("resolving {}", cfg.chrome_host))?
-                .next()
-                .ok_or_else(|| anyhow!("no address for {}", cfg.chrome_host))?;
+        let addr: SocketAddr = tokio::net::lookup_host((cfg.chrome_host.as_str(), cfg.chrome_port))
+            .await
+            .with_context(|| format!("resolving {}", cfg.chrome_host))?
+            .next()
+            .ok_or_else(|| anyhow!("no address for {}", cfg.chrome_host))?;
 
         let endpoint = format!("http://{addr}");
         let (browser, mut handler) = Browser::connect(endpoint).await?;
@@ -203,7 +205,11 @@ impl Solver {
     async fn proxy(&self, path: &str) -> Result<FetchResult> {
         let res = self.fetch_once(path).await?;
         if Self::is_degraded(&res) {
-            tracing::info!(path, status = res.status, "degraded -> re-warming and retrying");
+            tracing::info!(
+                path,
+                status = res.status,
+                "degraded -> re-warming and retrying"
+            );
             self.warm().await.ok();
             return self.fetch_once(path).await;
         }
@@ -216,31 +222,68 @@ impl Solver {
     }
 }
 
-type Shared = Arc<Mutex<Solver>>;
+/// `None` while there is no live Chrome session; `maintain` fills it in.
+type Shared = Arc<Mutex<Option<Solver>>>;
 
-async fn connect_with_retry(cfg: &Config) -> Result<Solver> {
-    let mut backoff = Duration::from_secs(1);
-    for attempt in 1..=10u32 {
-        match Solver::connect(cfg).await {
-            Ok(solver) => return Ok(solver),
-            Err(e) => {
-                tracing::warn!(attempt, "connect failed: {e}");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(15));
-            }
-        }
-    }
-    Solver::connect(cfg).await.context("final connect attempt")
+#[derive(Clone)]
+struct AppState {
+    solver: Shared,
+    cfg: Config,
 }
 
-/// Recover a degraded session: relaunch a fresh tab when the connection is alive
-/// (`try_relaunch`), otherwise (or on relaunch failure) reconnect.
+/// Own the connection for the process lifetime
+async fn maintain(shared: Shared, cfg: Config) {
+    let mut backoff = RECONNECT_BACKOFF_MIN;
+
+    loop {
+        // Bind before the branch: holding the guard into the block would deadlock
+        // against the store below.
+        let idle = shared.lock().await.is_none();
+
+        if idle {
+            match Solver::connect(&cfg).await {
+                Ok(solver) => {
+                    tracing::info!("connected to Chrome");
+                    *shared.lock().await = Some(solver);
+                    backoff = RECONNECT_BACKOFF_MIN;
+                }
+                Err(e) => {
+                    tracing::warn!(retry_in = ?backoff, "connect failed: {e}");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                }
+            }
+            continue;
+        }
+
+        tokio::time::sleep(WARM_INTERVAL).await;
+
+        let warmed = {
+            let guard = shared.lock().await;
+            match guard.as_ref() {
+                Some(solver) => solver.warm().await,
+                None => continue,
+            }
+        };
+        if let Err(e) = warmed {
+            tracing::warn!("re-warm failed ({e}); recovering");
+            recover(&shared, &cfg, true).await;
+        }
+    }
+}
+
+/// Recover a degraded session
 async fn recover(shared: &Shared, cfg: &Config, try_relaunch: bool) {
     if try_relaunch {
         // `new_page`/`close` can hang on a half-dead connection; bound it.
         let relaunched = {
             let mut guard = shared.lock().await;
-            tokio::time::timeout(Duration::from_secs(45), guard.relaunch()).await
+            match guard.as_mut() {
+                Some(solver) => {
+                    tokio::time::timeout(Duration::from_secs(45), solver.relaunch()).await
+                }
+                None => Ok(Err(anyhow!("no live session"))),
+            }
         };
 
         match relaunched {
@@ -250,12 +293,14 @@ async fn recover(shared: &Shared, cfg: &Config, try_relaunch: bool) {
         }
     }
 
-    if let Ok(solver) = connect_with_retry(cfg).await {
-        let old = {
-            let mut guard = shared.lock().await;
-            std::mem::replace(&mut *guard, solver)
-        };
+    let old = shared.lock().await.take();
+    if let Some(old) = old {
         old.close().await;
+    }
+
+    match Solver::connect(cfg).await {
+        Ok(solver) => *shared.lock().await = Some(solver),
+        Err(e) => tracing::warn!("reconnect failed ({e}); retrying in the background"),
     }
 }
 
@@ -263,7 +308,24 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 
-async fn proxy_handler(State(shared): State<Shared>, uri: Uri) -> Response {
+/// Run `proxy` against the live session, or `None` if there isn't one.
+async fn try_proxy(shared: &Shared, path: &str) -> Option<Result<FetchResult>> {
+    let guard = shared.lock().await;
+    match guard.as_ref() {
+        Some(solver) => Some(solver.proxy(path).await),
+        None => None,
+    }
+}
+
+fn unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no live Chrome session; retrying in the background",
+    )
+        .into_response()
+}
+
+async fn proxy_handler(State(state): State<AppState>, uri: Uri) -> Response {
     let path = uri
         .path_and_query()
         .map(|pq| pq.as_str())
@@ -271,11 +333,18 @@ async fn proxy_handler(State(shared): State<Shared>, uri: Uri) -> Response {
         .to_string();
 
     if !(path.starts_with("/data-api/") || path.starts_with("/search-api/")) {
-        return (StatusCode::NOT_FOUND, "only /data-api/* and /search-api/* are proxied")
+        return (
+            StatusCode::NOT_FOUND,
+            "only /data-api/* and /search-api/* are proxied",
+        )
             .into_response();
     }
 
-    let first = shared.lock().await.proxy(&path).await;
+    let shared = &state.solver;
+
+    let Some(first) = try_proxy(shared, &path).await else {
+        return unavailable();
+    };
 
     // `Err` = connection dropped (reconnect); `Ok` degraded = page bad but
     // connection alive (relaunch first).
@@ -286,9 +355,11 @@ async fn proxy_handler(State(shared): State<Shared>, uri: Uri) -> Response {
 
     let res = if degraded {
         tracing::warn!(path, "session degraded; recovering");
-        let cfg = shared.lock().await.cfg.clone();
-        recover(&shared, &cfg, try_relaunch).await;
-        shared.lock().await.proxy(&path).await
+        recover(shared, &state.cfg, try_relaunch).await;
+        match try_proxy(shared, &path).await {
+            Some(res) => res,
+            None => return unavailable(),
+        }
     } else {
         first
     };
@@ -336,8 +407,7 @@ async fn shutdown_signal() {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -352,29 +422,16 @@ async fn main() -> Result<()> {
         origin = %cfg.origin,
         "connecting to Chrome and warming"
     );
-    let solver = connect_with_retry(&cfg).await.context("initial connect")?;
-    let shared: Shared = Arc::new(Mutex::new(solver));
-
-    // Periodically re-warm so the token never goes stale under low traffic.
-    {
-        let shared = shared.clone();
-        let cfg = cfg.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(180)).await;
-                let warmed = shared.lock().await.warm().await;
-                if let Err(e) = warmed {
-                    tracing::warn!("re-warm failed ({e}); recovering");
-                    recover(&shared, &cfg, true).await;
-                }
-            }
-        });
-    }
+    let shared: Shared = Arc::new(Mutex::new(None));
+    tokio::spawn(maintain(shared.clone(), cfg.clone()));
 
     let app = Router::new()
         .route("/healthz", get(health))
         .fallback(proxy_handler)
-        .with_state(shared);
+        .with_state(AppState {
+            solver: shared,
+            cfg,
+        });
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!(%addr, "listening");
