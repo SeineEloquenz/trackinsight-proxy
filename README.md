@@ -15,6 +15,7 @@ A reverse proxy that fronts [TrackInsight](https://www.trackinsight.com)'s publi
 
 | Variable                | Default                          | Description                              |
 | ----------------------- | -------------------------------- | ---------------------------------------- |
+| `SOLVER_HOST`           | `0.0.0.0`                        | Listen address                           |
 | `SOLVER_PORT`           | `8191`                           | Listen port                              |
 | `CHROME_URL`            | `http://127.0.0.1:9222`          | CDP endpoint of the headless-Chrome sidecar |
 | `TRACKINSIGHT_ORIGIN`   | `https://www.trackinsight.com`   | Upstream origin                          |
@@ -37,6 +38,18 @@ curl localhost:8191/data-api/holdings/QQQ.json
 ```
 
 See [`docker-compose.yml`](docker-compose.yml).
+
+## Run (NixOS)
+
+The flake's `nixosModules.default` runs the proxy and a headless Chromium on
+localhost:
+
+```nix
+services.trackinsight-proxy.enable = true;
+```
+
+The proxy listens on `127.0.0.1:8191` and Chromium on `127.0.0.1:9222`. Set
+`chromium.enable = false` and `chromeUrl` to use an existing Chrome instead.
 
 ## Build
 

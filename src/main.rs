@@ -1,6 +1,11 @@
 //! trackinsight-proxy
 
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    env,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 const WARM_INTERVAL: Duration = Duration::from_secs(180);
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -412,6 +417,12 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Config::from_env();
+    let host: IpAddr = match env::var("SOLVER_HOST") {
+        Ok(s) => s
+            .parse()
+            .with_context(|| format!("invalid SOLVER_HOST {s:?}"))?,
+        Err(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+    };
     let port: u16 = env::var("SOLVER_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -433,7 +444,7 @@ async fn main() -> Result<()> {
             cfg,
         });
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::new(host, port);
     tracing::info!(%addr, "listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)

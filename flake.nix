@@ -27,6 +27,8 @@
         }
       );
 
+      nixosModules.default = import ./nixos-module.nix self;
+
       devShells = forAllSystems (
         system:
         let
