@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use calamine::{Data, Reader, Xlsx};
+use calamine::{open_workbook_auto_from_rs, Data, Reader};
 
 use crate::breakdown::Holding;
 
@@ -36,9 +36,10 @@ const SECTOR: &[&str] = &[
     "industry",
 ];
 
-/// Reads the holdings of the first worksheet of an issuer's xlsx export by recognising its header row.
-pub fn holdings_from_xlsx(bytes: &[u8]) -> Result<Vec<Holding>> {
-    let mut book = Xlsx::new(std::io::Cursor::new(bytes)).context("opening workbook")?;
+/// Reads the holdings of the first worksheet of an issuer's xls or xlsx export by recognising its header row.
+pub fn holdings_from_workbook(bytes: &[u8]) -> Result<Vec<Holding>> {
+    let mut book =
+        open_workbook_auto_from_rs(std::io::Cursor::new(bytes)).context("opening workbook")?;
     let range = book
         .worksheet_range_at(0)
         .ok_or_else(|| anyhow!("workbook has no sheets"))??;
@@ -126,12 +127,12 @@ impl Columns {
     fn find(row: &[Cell]) -> Option<Self> {
         let headers: Vec<String> = row
             .iter()
-            .map(|c| c.text().unwrap_or_default().to_lowercase())
+            .map(|c| compact(c.text().unwrap_or_default()))
             .collect();
         let pick = |names: &[&str]| {
             names
                 .iter()
-                .find_map(|n| headers.iter().position(|h| h == n))
+                .find_map(|n| headers.iter().position(|h| *h == compact(n)))
         };
         Some(Self {
             name: pick(NAME)?,
@@ -140,6 +141,14 @@ impl Columns {
             sector: pick(SECTOR),
         })
     }
+}
+
+fn compact(header: &str) -> String {
+    header
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '%')
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 #[cfg(test)]
@@ -157,7 +166,7 @@ mod tests {
             vec![Cell::Empty],
             vec![
                 t("ISIN"),
-                t("Security Name"),
+                t("SecurityName"),
                 t("Percent of Fund"),
                 t("Trade Country Name"),
                 t("Sector Classification"),

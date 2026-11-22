@@ -25,7 +25,7 @@ pub async fn fetch(issuers: &Issuers, isin: &str) -> Result<Option<Breakdown>> {
         .error_for_status()?
         .bytes()
         .await?;
-    let holdings = sheet::holdings_from_xlsx(&bytes)?;
+    let holdings = sheet::holdings_from_workbook(&bytes)?;
     Ok(Some(Breakdown::from_holdings(holdings)))
 }
 

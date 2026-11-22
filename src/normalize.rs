@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::LazyLock};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::LazyLock,
+};
 
 /// Ghostfolio's country names, which are those of `countries-list`.
 const COUNTRIES: &[(&str, &str)] = &[
@@ -318,6 +321,8 @@ const SECTORS: &[(&str, &[&str])] = &[
         &[
             "Materials",
             "Non-Energy Materials",
+            "Basic Industries",
+            "Basic Industry",
             "Basic Resources",
             "Chemicals",
             "Construction Materials",
@@ -455,6 +460,7 @@ const SECTORS: &[(&str, &[&str])] = &[
         &[
             "Equity Real Estate Investment Trusts (REITs)",
             "Real Estate Management & Development",
+            "Property",
             "Diversified REITs",
             "Industrial REITs",
             "Hotel & Resort REITs",
@@ -485,6 +491,7 @@ const SECTORS: &[(&str, &[&str])] = &[
             "Electric Utilities",
             "Gas Utilities",
             "Multi-Utilities",
+            "Electric",
             "Water Utilities",
             "Independent Power and Renewable Electricity Producers",
             "Independent Power & Renewable Electricity Producers",
@@ -506,7 +513,7 @@ const SECTOR_KEYWORDS: &[(&str, &[&str])] = &[
     ),
     (
         "Healthcare",
-        &["health", "pharma", "biotech", "medical", "life"],
+        &["health", "pharm", "medtech", "biotech", "medical", "life"],
     ),
     (
         "Technology",
@@ -618,13 +625,14 @@ const SECTOR_KEYWORDS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Markers issuers use for cash, derivatives and unclassified positions.
+/// Markers issuers use for cash, derivatives, totals and unclassified positions.
 const UNCLASSIFIED: &[&str] = &[
     "",
     "-",
     "n/a",
     "none",
     "null",
+    "total",
     "unassigned",
     "unknown",
     "cash",
@@ -635,7 +643,7 @@ const UNCLASSIFIED: &[&str] = &[
     "supranational",
 ];
 
-fn key(name: &str) -> String {
+fn words(name: &str) -> Vec<String> {
     let folded: String = name
         .chars()
         .map(|c| match c {
@@ -645,50 +653,79 @@ fn key(name: &str) -> String {
             'í' | 'ì' | 'î' | 'ï' => 'i',
             'ó' | 'ò' | 'ô' | 'ö' | 'õ' => 'o',
             'ú' | 'ù' | 'û' | 'ü' => 'u',
-            '&' => ' ',
             c => c.to_ascii_lowercase(),
         })
         .collect();
-    let words: Vec<&str> = folded
+    folded
         .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|w| !w.is_empty() && *w != "and" && *w != "the")
-        .collect();
-    words.join(" ")
+        .filter(|w| !w.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
-fn is_unclassified(k: &str) -> bool {
-    UNCLASSIFIED.iter().any(|u| key(u) == k)
+/// Spacing-insensitive keys, with and without filler words, so `UnitedStates`,
+/// `Oil, Gas and Consumable Fuels` and `Oil, Gas & Consumable Fuels` match.
+fn keys(name: &str) -> [String; 2] {
+    let words = words(name);
+    let without_fillers = words.iter().filter(|w| *w != "and" && *w != "the");
+    [
+        words.concat(),
+        without_fillers.map(String::as_str).collect(),
+    ]
+}
+
+fn index<'a>(
+    entries: impl Iterator<Item = (&'a str, &'static str)>,
+) -> HashMap<String, &'static str> {
+    let mut index = HashMap::new();
+    for (name, value) in entries {
+        for k in keys(name) {
+            index.insert(k, value);
+        }
+    }
+    index
+}
+
+fn lookup(index: &HashMap<String, &'static str>, name: &str) -> Option<&'static str> {
+    keys(name).iter().find_map(|k| index.get(k).copied())
+}
+
+static UNCLASSIFIED_KEYS: LazyLock<HashSet<String>> =
+    LazyLock::new(|| UNCLASSIFIED.iter().flat_map(|u| keys(u)).collect());
+
+fn is_unclassified(name: &str) -> bool {
+    keys(name).iter().any(|k| UNCLASSIFIED_KEYS.contains(k))
 }
 
 static COUNTRY_INDEX: LazyLock<HashMap<String, &'static str>> = LazyLock::new(|| {
     let by_code: HashMap<&str, &'static str> = COUNTRIES.iter().copied().collect();
-    let mut index = HashMap::new();
-    for (code, name) in COUNTRIES {
-        index.insert(key(name), *name);
-        index.insert(key(code), *name);
-    }
-    for (alias, code) in COUNTRY_ALIASES {
-        index.insert(key(alias), by_code[code]);
-    }
-    index
+    index(
+        COUNTRIES
+            .iter()
+            .flat_map(|(code, name)| [(*name, *name), (*code, *name)])
+            .chain(
+                COUNTRY_ALIASES
+                    .iter()
+                    .map(|(alias, code)| (*alias, by_code[code])),
+            ),
+    )
 });
 
 static SECTOR_INDEX: LazyLock<HashMap<String, &'static str>> = LazyLock::new(|| {
-    let mut index = HashMap::new();
-    for (sector, names) in SECTORS {
-        index.insert(key(sector), *sector);
-        for name in *names {
-            index.insert(key(name), *sector);
-        }
-    }
-    index
+    index(SECTORS.iter().flat_map(|(sector, names)| {
+        std::iter::once(*sector)
+            .chain(names.iter().copied())
+            .map(|n| (n, *sector))
+    }))
 });
 
 /// Ghostfolio's name for a country given by name or ISO 3166 alpha-2 code.
 pub fn country(name: &str) -> Option<&'static str> {
-    let k = key(name);
-    let found = COUNTRY_INDEX.get(&k).copied();
-    if found.is_none() && !is_unclassified(&k) && !k.starts_with("other") {
+    if is_unclassified(name) {
+        return None;
+    }
+    let found = lookup(&COUNTRY_INDEX, name);
+    if found.is_none() && !keys(name)[0].starts_with("other") {
         tracing::warn!(country = name, "unknown country");
     }
     found
@@ -696,14 +733,18 @@ pub fn country(name: &str) -> Option<&'static str> {
 
 /// Ghostfolio's name for a sector, `Other` for unknown sectors and `None` for cash and similar markers.
 pub fn sector(name: &str) -> Option<&'static str> {
-    let k = key(name);
-    if is_unclassified(&k) {
+    if is_unclassified(name) {
         return None;
     }
-    let found = SECTOR_INDEX.get(&k).copied().or_else(|| {
+    let found = lookup(&SECTOR_INDEX, name).or_else(|| {
+        let words = words(name);
         SECTOR_KEYWORDS
             .iter()
-            .find(|(_, words)| words.iter().any(|w| k.split(' ').any(|t| t.starts_with(w))))
+            .find(|(_, prefixes)| {
+                prefixes
+                    .iter()
+                    .any(|p| words.iter().any(|w| w.starts_with(p)))
+            })
             .map(|(sector, _)| *sector)
     });
     Some(found.unwrap_or_else(|| {
@@ -714,8 +755,7 @@ pub fn sector(name: &str) -> Option<&'static str> {
 
 /// Whether a holding's sector marks it as cash, a derivative or otherwise not a security.
 pub fn is_non_security(sector: &str) -> bool {
-    let k = key(sector);
-    !k.is_empty() && is_unclassified(&k)
+    !sector.trim().is_empty() && is_unclassified(sector)
 }
 
 #[cfg(test)]
@@ -737,10 +777,20 @@ mod tests {
             ("Curaçao", "Curacao"),
             ("US", "United States"),
             ("Taiwan", "Taiwan"),
+            ("UnitedStates", "United States"),
+            ("HongKong", "Hong Kong"),
         ] {
             assert_eq!(country(input), Some(expected), "{input}");
         }
-        for input in ["European Union", "None", "null", "-", "Other"] {
+        for input in [
+            "European Union",
+            "None",
+            "null",
+            "-",
+            "Other",
+            "Cashand/orDerivatives",
+            "N/A",
+        ] {
             assert_eq!(country(input), None, "{input}");
         }
     }
@@ -770,11 +820,26 @@ mod tests {
             ("Apparel Retail", "Consumer Cyclical"),
             ("Electrical Components & Equipment", "Industrials"),
             ("Life & Health Insurance", "Financial Services"),
+            ("informationTechnology", "Technology"),
+            ("consumerDiscretionary", "Consumer Cyclical"),
+            ("Pharm/MedTech", "Healthcare"),
+            ("Industrial Cyclicals", "Industrials"),
+            ("Technology - Semi & Hardware", "Technology"),
+            ("Consumer Cyclical & Services", "Consumer Cyclical"),
+            ("Basic Industries", "Basic Materials"),
+            ("Property", "Real Estate"),
             ("Others", "Other"),
         ] {
             assert_eq!(sector(input), Some(expected), "{input}");
         }
-        for input in ["Cash and/or Derivatives", "Unassigned", "unknown", "None"] {
+        for input in [
+            "Cash and/or Derivatives",
+            "Unassigned",
+            "unknown",
+            "None",
+            "Total",
+            "Cashand/orDerivatives",
+        ] {
             assert_eq!(sector(input), None, "{input}");
         }
     }
