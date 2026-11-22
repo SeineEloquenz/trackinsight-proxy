@@ -21,6 +21,7 @@ pub async fn fetch(issuers: &Issuers, isin: &str) -> Result<Option<Breakdown>> {
     if !res.status().is_success() || !is_sheet {
         return Ok(None);
     }
-    let holdings = sheet::holdings_from_workbook(&res.bytes().await?)?;
+    let mut holdings = sheet::holdings_from_workbook(&res.bytes().await?)?;
+    issuers.fill_sectors(&mut holdings).await?;
     Ok(Some(Breakdown::from_holdings(holdings)))
 }

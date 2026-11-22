@@ -27,7 +27,9 @@ const COUNTRY: &[&str] = &[
     "trade country name",
     "location",
     "country name",
+    "country of issue",
 ];
+const ISIN: &[&str] = &["isin", "isin code"];
 const SECTOR: &[&str] = &[
     "sector",
     "sector classification",
@@ -108,6 +110,7 @@ pub fn holdings_from_rows(rows: &[Vec<Cell>]) -> Result<Vec<Holding>> {
         .filter_map(|row| {
             Some(Holding {
                 name: at(row, Some(cols.name))?,
+                isin: at(row, cols.isin),
                 weight: row.get(cols.weight)?.number()?,
                 country: at(row, cols.country),
                 sector: at(row, cols.sector),
@@ -119,6 +122,7 @@ pub fn holdings_from_rows(rows: &[Vec<Cell>]) -> Result<Vec<Holding>> {
 struct Columns {
     name: usize,
     weight: usize,
+    isin: Option<usize>,
     country: Option<usize>,
     sector: Option<usize>,
 }
@@ -138,6 +142,7 @@ impl Columns {
             name: pick(NAME)?,
             weight: pick(WEIGHT)?,
             country: pick(COUNTRY),
+            isin: pick(ISIN),
             sector: pick(SECTOR),
         })
     }
@@ -190,6 +195,7 @@ mod tests {
         let h = holdings_from_rows(&rows).unwrap();
         assert_eq!(h.len(), 1);
         assert_eq!(h[0].name, "Apple");
+        assert_eq!(h[0].isin.as_deref(), Some("US0378331005"));
         assert_eq!(h[0].weight, 5.5);
         assert_eq!(h[0].country.as_deref(), Some("United States"));
     }

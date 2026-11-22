@@ -13,6 +13,10 @@ const HOLDINGS: &str = "https://www.ishares.com/varnish-api/uk-retail01-product-
 const SITES: &[(&str, &str)] = &[("ch-ishares-v2", "en_CH"), ("uk-ishares-v2", "en_GB")];
 
 pub async fn fetch(issuers: &Issuers, isin: &str) -> Result<Option<Breakdown>> {
+    Ok(holdings(issuers, isin).await?.map(Breakdown::from_holdings))
+}
+
+pub async fn holdings(issuers: &Issuers, isin: &str) -> Result<Option<Vec<Holding>>> {
     let funds = issuers.ishares.get(|| funds(issuers)).await?;
     let Some(id) = funds.get(isin) else {
         return Ok(None);
@@ -54,27 +58,32 @@ async fn funds(issuers: &Issuers) -> Result<HashMap<String, u64>> {
     Ok(funds)
 }
 
-fn parse(doc: &Value) -> Result<Breakdown> {
+fn parse(doc: &Value) -> Result<Vec<Holding>> {
     let points = &doc["componentsByNameMap"]["holdings"]["containersByNameMap"]["all"]
         ["dataPointsByNameMap"];
     let column = |name: &str| points[name]["value"].as_array();
     let names = column("issueName").context("iShares holdings without names")?;
     let weights = column("holdingPercent").context("iShares holdings without weights")?;
     let text = |col: Option<&Vec<Value>>, i: usize| col?.get(i)?.as_str().map(str::to_owned);
-    let (countries, sectors) = (column("countryOfRisk"), column("sectorName"));
+    let (isins, countries, sectors) = (
+        column("isin"),
+        column("countryOfRisk"),
+        column("sectorName"),
+    );
     let holdings = names
         .iter()
         .enumerate()
         .filter_map(|(i, name)| {
             Some(Holding {
                 name: name.as_str()?.to_owned(),
+                isin: text(isins, i),
                 weight: weights.get(i)?.as_f64()?,
                 country: text(countries, i),
                 sector: text(sectors, i),
             })
         })
         .collect();
-    Ok(Breakdown::from_holdings(holdings))
+    Ok(holdings)
 }
 
 #[cfg(test)]
@@ -92,7 +101,7 @@ mod tests {
             "countryOfRisk": col(json!(["Taiwan", "United States"])),
             "sectorName": col(json!(["Information Technology", "Cash and/or Derivatives"])),
         }}}}}});
-        let rendered = parse(&doc).unwrap().render();
+        let rendered = Breakdown::from_holdings(parse(&doc).unwrap()).render();
         assert_eq!(rendered["weight"], 0.99);
         assert_eq!(rendered["countries"]["Taiwan"]["weight"], 0.99);
     }

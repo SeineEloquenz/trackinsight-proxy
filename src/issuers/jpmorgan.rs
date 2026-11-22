@@ -62,6 +62,7 @@ fn parse(fund: &Value) -> Breakdown {
             let kind = h["securityType"].as_str().unwrap_or_default();
             Some(Holding {
                 name: h["securityDescription"].as_str()?.to_owned(),
+                isin: h["securityIsin"].as_str().map(str::to_owned),
                 weight: h["marketValuePercent"].as_f64()?,
                 country: h["country"].as_str().map(str::to_owned),
                 sector: kind.eq_ignore_ascii_case("cash").then(|| kind.to_owned()),

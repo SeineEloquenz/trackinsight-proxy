@@ -25,7 +25,8 @@ pub async fn fetch(issuers: &Issuers, isin: &str) -> Result<Option<Breakdown>> {
         .error_for_status()?
         .bytes()
         .await?;
-    let holdings = sheet::holdings_from_workbook(&bytes)?;
+    let mut holdings = sheet::holdings_from_workbook(&bytes)?;
+    issuers.fill_sectors(&mut holdings).await?;
     Ok(Some(Breakdown::from_holdings(holdings)))
 }
 

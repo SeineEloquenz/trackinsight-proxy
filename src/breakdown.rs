@@ -9,6 +9,7 @@ const TOP_HOLDINGS: usize = 10;
 #[derive(Debug, Clone)]
 pub struct Holding {
     pub name: String,
+    pub isin: Option<String>,
     pub weight: f64,
     pub country: Option<String>,
     pub sector: Option<String>,
@@ -118,6 +119,7 @@ mod tests {
     fn holding(name: &str, weight: f64, country: &str, sector: &str) -> Holding {
         Holding {
             name: name.into(),
+            isin: None,
             weight,
             country: Some(country.into()),
             sector: Some(sector.into()),

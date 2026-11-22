@@ -6,7 +6,7 @@ use crate::{breakdown::Breakdown, sheet};
 
 const DOCUMENTS: &str = "https://www.assetmanagement.hsbc.co.uk/api/v1/download/document";
 
-/// HSBC's holdings export lists countries but no sectors.
+/// HSBC's holdings export lists no sectors.
 pub async fn fetch(issuers: &Issuers, isin: &str) -> Result<Option<Breakdown>> {
     let res = issuers
         .http
@@ -19,6 +19,7 @@ pub async fn fetch(issuers: &Issuers, isin: &str) -> Result<Option<Breakdown>> {
     if res.status() == StatusCode::NOT_FOUND {
         return Ok(None);
     }
-    let holdings = sheet::holdings_from_workbook(&res.error_for_status()?.bytes().await?)?;
+    let mut holdings = sheet::holdings_from_workbook(&res.error_for_status()?.bytes().await?)?;
+    issuers.fill_sectors(&mut holdings).await?;
     Ok(Some(Breakdown::from_holdings(holdings)))
 }

@@ -639,6 +639,7 @@ const UNCLASSIFIED: &[&str] = &[
     "cash and or derivatives",
     "cash and derivatives",
     "derivatives",
+    "europe",
     "european union",
     "supranational",
 ];
