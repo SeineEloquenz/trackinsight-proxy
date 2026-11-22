@@ -1,5 +1,5 @@
 {
-  description = "Headless-Chromium reverse proxy that solves TrackInsight's AWS WAF challenge";
+  description = "TrackInsight API for Ghostfolio backed by the holdings fund issuers publish";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -42,7 +42,6 @@
               rust-analyzer
               clippy
               rustfmt
-              chromium
             ];
           };
         }

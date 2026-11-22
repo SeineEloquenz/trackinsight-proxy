@@ -1,18 +1,18 @@
 [package]
 name = "trackinsight-proxy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
-description = "A headless-Chromium reverse proxy that solves the AWS WAF challenge guarding TrackInsight's public data API"
+description = "Serves TrackInsight's fund API for Ghostfolio from the holdings fund issuers publish"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/SeineEloquenz/trackinsight-proxy"
 
 [dependencies]
 anyhow = "1"
 axum = "0.8"
-chaser-oxide = "0.2.3"
-futures = "0.3.34"
-serde = { version = "1", features = ["derive"] }
+calamine = { version = "0.35.0", default-features = false }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "gzip", "rustls-no-provider"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"

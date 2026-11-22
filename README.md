@@ -1,69 +1,71 @@
 # trackinsight-proxy
 
-A reverse proxy that fronts [TrackInsight](https://www.trackinsight.com)'s public data API.
+Serves the parts of [TrackInsight](https://www.trackinsight.com)'s API that
+[Ghostfolio](https://ghostfol.io) uses to enrich ETFs, built from the holdings
+the fund issuers publish themselves. It needs no configuration. Funds are found
+by the ISIN in the symbol Ghostfolio asks for.
+
+## Issuers
+
+| Issuer    | Source                                      |
+| --------- | ------------------------------------------- |
+| iShares   | Product screener and holdings API           |
+| Amundi    | Product API, index allocation for swap ETFs |
+| Vanguard  | GraphQL API of the Vanguard site            |
+| SPDR      | Fund finder and daily holdings workbook     |
+| Xtrackers | Constituents workbook                       |
+
+Each issuer's fund list is loaded once a day and holdings are cached for a day.
+Countries and sectors are translated to the names Ghostfolio uses, including
+GICS and ICB industries.
 
 ## Endpoints
 
-| Route              | Behaviour                                              |
-| ------------------ | ------------------------------------------------------ |
-| `GET /healthz`     | `200 OK` once the browser is up                        |
-| `GET /data-api/*`  | proxied to `${TRACKINSIGHT_ORIGIN}/data-api/*`         |
-| `GET /search-api/*`| proxied to `${TRACKINSIGHT_ORIGIN}/search-api/*`       |
-| anything else      | `404`                                                  |
+| Route                                    | Response                                                    |
+| ---------------------------------------- | ----------------------------------------------------------- |
+| `GET /search-api/search_v2/{symbol}/...` | the ISIN in `symbol` as the only result if an issuer has it |
+| `GET /data-api/funds/{ISIN}.json`        | `{ "isins": [ISIN] }`                                       |
+| `GET /data-api/holdings/{ISIN}.json`     | `weight`, `countries`, `sectors` and `topHoldings`          |
+| `GET /healthz`                           | `200 OK`                                                    |
+
+`weight` is the share of the fund with a known country and sector. Ghostfolio
+ignores holdings below 0.85.
+
+## Ghostfolio
+
+Route TrackInsight to the proxy with the `PROXY_ROUTES` property.
+
+```json
+[{ "domain": "www.trackinsight.com", "url": "http://127.0.0.1:8191" }]
+```
+
+The ETF's symbol or its TrackInsight symbol mapping has to contain the ISIN,
+such as `IE00B4L5YC18`.
 
 ## Configuration (environment)
 
-| Variable                | Default                          | Description                              |
-| ----------------------- | -------------------------------- | ---------------------------------------- |
-| `SOLVER_HOST`           | `0.0.0.0`                        | Listen address                           |
-| `SOLVER_PORT`           | `8191`                           | Listen port                              |
-| `CHROME_URL`            | `http://127.0.0.1:9222`          | CDP endpoint of the headless-Chrome sidecar |
-| `TRACKINSIGHT_ORIGIN`   | `https://www.trackinsight.com`   | Upstream origin                          |
-| `WARM_URL`              | `${ORIGIN}/en/etf/US/QQQ/`       | Page loaded to obtain the WAF token      |
-| `WARM_DELAY_SECS`       | `6`                              | Wait after navigation before probing     |
-| `RUST_LOG`              | `info`                           | Log filter                               |
-
-> The Chrome host in `CHROME_URL` is resolved to an IP before connecting —
-> Chrome's DevTools endpoint rejects `Host` headers that aren't an IP literal or
-> `localhost` (DNS-rebinding protection), so connecting by service name works
-> transparently.
-
-## Run (Docker Compose)
-
-The intended deployment is the proxy plus a headless-Chrome sidecar:
-
-```sh
-docker compose up -d
-curl localhost:8191/data-api/holdings/QQQ.json
-```
-
-See [`docker-compose.yml`](docker-compose.yml).
+| Variable      | Default     | Description    |
+| ------------- | ----------- | -------------- |
+| `LISTEN_HOST` | `127.0.0.1` | Listen address |
+| `LISTEN_PORT` | `8191`      | Listen port    |
+| `RUST_LOG`    | `info`      | Log filter     |
 
 ## Run (NixOS)
-
-The flake's `nixosModules.default` runs the proxy and a headless Chromium on
-localhost:
 
 ```nix
 services.trackinsight-proxy.enable = true;
 ```
 
-The proxy listens on `127.0.0.1:8191` and Chromium on `127.0.0.1:9222`. Set
-`chromium.enable = false` and `chromeUrl` to use an existing Chrome instead.
+## Run (Docker Compose)
+
+```sh
+docker compose up -d
+curl localhost:8191/data-api/holdings/IE00B4L5YC18.json
+```
 
 ## Build
 
 ```sh
-nix build .#default                 # the binary
-nix build .#image                   # the OCI image (binary only, ~60 MB)
-docker load < result
-```
-
-Dev shell + local run (needs a Chrome with remote debugging):
-
-```sh
-nix develop
-chromium --headless=new --remote-debugging-port=9222 &   # or any headless Chrome
-cargo run                                                # CHROME_URL defaults to :9222
-curl localhost:8191/healthz
+nix build .#default
+nix build .#image
 ```
