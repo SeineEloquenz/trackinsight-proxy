@@ -17,11 +17,13 @@ by the ISIN in the symbol Ghostfolio asks for.
 | Invesco   | Holdings API, index allocation for swap ETFs |
 | JPMorgan  | Fund data API                               |
 | HSBC      | Holdings workbook                           |
+| UBS       | Constituents API, physical ETFs only        |
 
 Each issuer's fund list is loaded once a day and holdings are cached for a day.
 Countries and sectors are translated to the names Ghostfolio uses, including
-GICS and ICB industries. Holdings published without sectors get the sector
-their ISIN has in iShares MSCI World IMI or Core MSCI EM IMI.
+GICS and ICB industries. Holdings published without countries or sectors get
+the ones their ISIN has in iShares MSCI World IMI or Core MSCI EM IMI. UBS
+publishes only the collateral basket of its swap ETFs, so those are not served.
 
 ## Endpoints
 

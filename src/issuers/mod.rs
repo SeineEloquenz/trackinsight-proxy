@@ -14,6 +14,7 @@ mod invesco;
 mod ishares;
 mod jpmorgan;
 mod spdr;
+mod ubs;
 mod vanguard;
 mod xtrackers;
 
@@ -29,7 +30,13 @@ pub struct Issuers {
     vanguard: Cached<HashMap<String, String>>,
     spdr: Cached<HashMap<String, String>>,
     jpmorgan: Cached<HashMap<String, &'static str>>,
-    reference_sectors: Cached<HashMap<String, String>>,
+    reference: Cached<HashMap<String, Classification>>,
+}
+
+#[derive(Clone)]
+struct Classification {
+    country: Option<String>,
+    sector: Option<String>,
 }
 
 impl Issuers {
@@ -43,13 +50,13 @@ impl Issuers {
             vanguard: Cached::default(),
             spdr: Cached::default(),
             jpmorgan: Cached::default(),
-            reference_sectors: Cached::default(),
+            reference: Cached::default(),
         })
     }
 
     /// The breakdown of the fund with this ISIN and its issuer's name, or `None` if no issuer offers it.
     pub async fn breakdown(&self, isin: &str) -> Result<Option<(&'static str, Breakdown)>> {
-        let (ishares, amundi, vanguard, spdr, xtrackers, invesco, jpmorgan, hsbc) = tokio::join!(
+        let (ishares, amundi, vanguard, spdr, xtrackers, invesco, jpmorgan, hsbc, ubs) = tokio::join!(
             ishares::fetch(self, isin),
             amundi::fetch(self, isin),
             vanguard::fetch(self, isin),
@@ -58,6 +65,7 @@ impl Issuers {
             invesco::fetch(self, isin),
             jpmorgan::fetch(self, isin),
             hsbc::fetch(self, isin),
+            ubs::fetch(self, isin),
         );
         let mut failure = None;
         for (issuer, result) in [
@@ -69,6 +77,7 @@ impl Issuers {
             ("Invesco", invesco),
             ("JPMorgan", jpmorgan),
             ("HSBC", hsbc),
+            ("UBS", ubs),
         ] {
             match result {
                 Ok(Some(b)) => return Ok(Some((issuer, b))),
@@ -82,34 +91,47 @@ impl Issuers {
         failure.map_or(Ok(None), Err)
     }
 
-    /// Gives holdings without any sectors the sector their ISIN has in the reference funds.
-    async fn fill_sectors(&self, holdings: &mut [Holding]) -> Result<()> {
-        if holdings.iter().any(|h| h.sector.is_some()) {
+    /// Gives holdings the country and sector their ISIN has in the reference funds when none of them have one.
+    async fn fill_from_reference(&self, holdings: &mut [Holding]) -> Result<()> {
+        let countries = holdings.iter().all(|h| h.country.is_none());
+        let sectors = holdings.iter().all(|h| h.sector.is_none());
+        if !countries && !sectors {
             return Ok(());
         }
-        let sectors = self
-            .reference_sectors
-            .get(|| self.load_reference_sectors())
-            .await?;
+        let reference = self.reference.get(|| self.load_reference()).await?;
         for h in holdings {
-            h.sector = h.isin.as_ref().and_then(|isin| sectors.get(isin)).cloned();
+            let Some(r) = h.isin.as_ref().and_then(|isin| reference.get(isin)) else {
+                continue;
+            };
+            if countries {
+                h.country = r.country.clone();
+            }
+            if sectors {
+                h.sector = r.sector.clone();
+            }
         }
         Ok(())
     }
 
-    async fn load_reference_sectors(&self) -> Result<HashMap<String, String>> {
-        let mut sectors = HashMap::new();
+    async fn load_reference(&self) -> Result<HashMap<String, Classification>> {
+        let mut reference = HashMap::new();
         for fund in REFERENCE_FUNDS {
             let holdings = ishares::holdings(self, fund)
                 .await?
                 .ok_or_else(|| anyhow!("iShares no longer lists reference fund {fund}"))?;
             for h in holdings {
-                if let (Some(isin), Some(sector)) = (h.isin, h.sector) {
-                    sectors.entry(isin).or_insert(sector);
+                if let Some(isin) = h.isin {
+                    reference.entry(isin).or_insert(Classification {
+                        country: h.country,
+                        sector: h.sector,
+                    });
                 }
             }
         }
-        tracing::info!(securities = sectors.len(), "loaded reference sectors");
-        Ok(sectors)
+        tracing::info!(
+            securities = reference.len(),
+            "loaded reference classifications"
+        );
+        Ok(reference)
     }
 }
