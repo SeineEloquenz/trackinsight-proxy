@@ -18,7 +18,7 @@ pub async fn fetch(issuers: &Issuers, isin: &str) -> Result<Option<Breakdown>> {
 
 pub async fn holdings(issuers: &Issuers, isin: &str) -> Result<Option<Vec<Holding>>> {
     let funds = issuers.ishares.get(|| funds(issuers)).await?;
-    let Some(id) = funds.get(isin) else {
+    let Some((id, _)) = funds.get(isin) else {
         return Ok(None);
     };
     let mut status = None;
@@ -39,7 +39,19 @@ pub async fn holdings(issuers: &Issuers, isin: &str) -> Result<Option<Vec<Holdin
     bail!("no iShares site serves the holdings of fund {id} ({status:?})")
 }
 
-async fn funds(issuers: &Issuers) -> Result<HashMap<String, u64>> {
+/// ISINs of the funds named after the index with this [`super::index_key`], in a stable order.
+pub async fn tracking(issuers: &Issuers, key: &str) -> Result<Vec<String>> {
+    let funds = issuers.ishares.get(|| funds(issuers)).await?;
+    let mut isins: Vec<String> = funds
+        .iter()
+        .filter(|(_, (_, name))| super::index_key(name) == key)
+        .map(|(isin, _)| isin.clone())
+        .collect();
+    isins.sort();
+    Ok(isins)
+}
+
+async fn funds(issuers: &Issuers) -> Result<HashMap<String, (u64, String)>> {
     let doc: Value = issuers
         .http
         .get(FUNDS)
@@ -48,11 +60,19 @@ async fn funds(issuers: &Issuers) -> Result<HashMap<String, u64>> {
         .error_for_status()?
         .json()
         .await?;
-    let funds: HashMap<String, u64> = doc
+    let funds: HashMap<String, (u64, String)> = doc
         .as_object()
         .context("iShares fund list is not an object")?
         .values()
-        .filter_map(|f| Some((f["isin"].as_str()?.to_owned(), f["portfolioId"].as_u64()?)))
+        .filter_map(|f| {
+            Some((
+                f["isin"].as_str()?.to_owned(),
+                (
+                    f["portfolioId"].as_u64()?,
+                    f["fundName"].as_str()?.to_owned(),
+                ),
+            ))
+        })
         .collect();
     tracing::info!(funds = funds.len(), "loaded iShares funds");
     Ok(funds)

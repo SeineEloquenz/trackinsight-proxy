@@ -23,10 +23,16 @@ const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KH
 /// iShares MSCI World IMI and Core MSCI EM IMI, which together hold the MSCI ACWI IMI universe.
 const REFERENCE_FUNDS: &[&str] = &["IE000AOK2013", "IE00BKM4GZ66"];
 
+/// Words in index and fund names that do not change which securities the index holds.
+const NOT_INDEX: &[&str] = &[
+    "ishares", "core", "ubs", "ucits", "etf", "acc", "dist", "index", "total", "return", "net",
+    "gross", "div", "reinv", "nr", "tr", "usd", "eur", "gbp", "chf", "jpy",
+];
+
 /// Fund issuers whose public sites publish holdings, found by ISIN.
 pub struct Issuers {
     http: Client,
-    ishares: Cached<HashMap<String, u64>>,
+    ishares: Cached<HashMap<String, (u64, String)>>,
     vanguard: Cached<HashMap<String, String>>,
     spdr: Cached<HashMap<String, String>>,
     jpmorgan: Cached<HashMap<String, &'static str>>,
@@ -91,6 +97,16 @@ impl Issuers {
         failure.map_or(Ok(None), Err)
     }
 
+    /// The breakdown of an iShares fund on the index with this name.
+    async fn index_breakdown(&self, index: &str) -> Result<Option<Breakdown>> {
+        for isin in ishares::tracking(self, &index_key(index)).await? {
+            if let Ok(Some(holdings)) = ishares::holdings(self, &isin).await {
+                return Ok(Some(Breakdown::from_holdings(holdings)));
+            }
+        }
+        Ok(None)
+    }
+
     /// Gives holdings the country and sector their ISIN has in the reference funds when none of them have one.
     async fn fill_from_reference(&self, holdings: &mut [Holding]) -> Result<()> {
         let countries = holdings.iter().all(|h| h.country.is_none());
@@ -133,5 +149,63 @@ impl Issuers {
             "loaded reference classifications"
         );
         Ok(reference)
+    }
+}
+
+/// The words of an index or fund name that identify the index, so that both name it the same way.
+fn index_key(name: &str) -> String {
+    let lower = name.to_lowercase();
+    let mut words: Vec<&str> = lower
+        .split(|c: char| !(c.is_alphanumeric() || c == '&'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    if let Some(hedged) = words.iter().position(|w| *w == "hedged") {
+        let start = words[..hedged]
+            .iter()
+            .rposition(|w| *w == "with")
+            .unwrap_or(hedged);
+        let end = if words.get(hedged + 1) == Some(&"to") {
+            hedged + 3
+        } else {
+            hedged + 1
+        };
+        words.drain(start..end.min(words.len()));
+    }
+    words
+        .into_iter()
+        .filter(|w| !NOT_INDEX.contains(w))
+        .map(|w| if w == "us" { "usa" } else { w })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::index_key;
+
+    #[test]
+    fn index_and_fund_names_share_a_key() {
+        let world_ex_usa = index_key("iShares MSCI World ex-USA UCITS ETF");
+        assert_eq!(world_ex_usa, "msci world ex usa");
+        assert_eq!(
+            index_key("MSCI World (ex US) (net div. reinv.)"),
+            world_ex_usa
+        );
+        assert_eq!(
+            index_key("MSCI ACWI with Developed Markets 100% hedged to JPY Index"),
+            index_key("iShares MSCI ACWI UCITS ETF")
+        );
+        assert_eq!(
+            index_key("MSCI World Total Return Net"),
+            index_key("iShares Core MSCI World UCITS ETF USD (Acc)")
+        );
+        assert_eq!(
+            index_key("iShares S&P 500 CHF Hedged UCITS ETF (Acc)"),
+            index_key("S&P 500")
+        );
+        assert_ne!(
+            index_key("MSCI World ESG Screened"),
+            index_key("MSCI World")
+        );
     }
 }

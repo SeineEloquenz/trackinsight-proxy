@@ -14,8 +14,10 @@ const LOCALE: &str = "en_CH_RETL";
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0";
 const SEGMENT: &str = "etf.emwh";
 const CONSTITUENTS: &str = "query GetConstituentsExcelv2($instId: String!, $sgmtKey: String!, $locale: String!) { getConstituentsExcel(instId: $instId, sgmtKey: $sgmtKey, locale: $locale) { etfFundHoldingsLargestConstituents { row { type cell { position data } } } } }";
+const INDEX: &str = "query getEtfFundDetailFeatureRespose($instId: String!, $locale: String!) { getEtfFundDetailFeatureRespose(instId: $instId, locale: $locale) { indexInformationFeatures { value } } }";
 
-/// UBS publishes only the collateral basket of swap ETFs, which says nothing about their index, so those are skipped.
+/// Swap ETFs and funds without published constituents get the holdings of an iShares fund on the same index,
+/// since UBS publishes only the collateral basket of swap ETFs.
 pub async fn fetch(issuers: &Issuers, isin: &str) -> Result<Option<Breakdown>> {
     let token = issuers
         .http
@@ -63,29 +65,63 @@ pub async fn fetch(issuers: &Issuers, isin: &str) -> Result<Option<Breakdown>> {
         "{API}/api/etf-funddetail-services/{id}/replication-type?locale={LOCALE}"
     )))
     .await?;
-    if replication["replicationType"]
+    let synthetic = replication["replicationType"]
         .as_str()
-        .is_some_and(|r| r.eq_ignore_ascii_case("synthetic"))
-    {
-        tracing::info!(isin, "skipping UBS swap ETF");
-        return Ok(None);
+        .is_some_and(|r| r.eq_ignore_ascii_case("synthetic"));
+    if !synthetic {
+        let doc = call(issuers.http.post(format!("{API}/graphql/")).json(&json!({
+            "operationName": "GetConstituentsExcelv2",
+            "query": CONSTITUENTS,
+            "variables": { "instId": id, "sgmtKey": SEGMENT, "locale": LOCALE },
+        })))
+        .await?;
+        let mut holdings = parse(&doc)?;
+        if !holdings.is_empty() {
+            issuers.fill_from_reference(&mut holdings).await?;
+            return Ok(Some(Breakdown::from_holdings(holdings)));
+        }
     }
 
     let doc = call(issuers.http.post(format!("{API}/graphql/")).json(&json!({
-        "operationName": "GetConstituentsExcelv2",
-        "query": CONSTITUENTS,
-        "variables": { "instId": id, "sgmtKey": SEGMENT, "locale": LOCALE },
+        "operationName": "getEtfFundDetailFeatureRespose",
+        "query": INDEX,
+        "variables": { "instId": id, "locale": LOCALE },
     })))
     .await?;
-    let mut holdings = parse(&doc)?;
-    issuers.fill_from_reference(&mut holdings).await?;
-    Ok(Some(Breakdown::from_holdings(holdings)))
+    let Some(index) = index_name(&doc) else {
+        return Ok(None);
+    };
+    let found = issuers.index_breakdown(index).await?;
+    tracing::info!(
+        isin,
+        index,
+        found = found.is_some(),
+        "using a fund on the index of a UBS fund"
+    );
+    Ok(found)
+}
+
+fn index_name(doc: &Value) -> Option<&str> {
+    doc["data"]["getEtfFundDetailFeatureRespose"]["indexInformationFeatures"]["value"]
+        .as_array()?
+        .iter()
+        .find(|f| {
+            f["label"]
+                .as_str()
+                .is_some_and(|l| l.eq_ignore_ascii_case("index name"))
+        })?["value"]
+        .as_str()
+        .filter(|v| !v.is_empty())
 }
 
 fn parse(doc: &Value) -> Result<Vec<Holding>> {
-    let rows = doc["data"]["getConstituentsExcel"]["etfFundHoldingsLargestConstituents"]["row"]
+    let Some(rows) = doc["data"]["getConstituentsExcel"]["etfFundHoldingsLargestConstituents"]
+        ["row"]
         .as_array()
-        .context("UBS constituents without rows")?;
+        .filter(|rows| !rows.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
     let cells = |row: &Value| -> Vec<(String, String)> {
         row["cell"]
             .as_array()
